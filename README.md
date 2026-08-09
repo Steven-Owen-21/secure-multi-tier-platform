@@ -56,37 +56,7 @@
 
 ## 🔄 Request Flow
 
-```mermaid
-sequenceDiagram
-    participant Client as Client
-    participant CF as CloudFront
-    participant WAF as WAF
-    participant ALB as ALB
-    participant APIGW as API Gateway
-    participant COG as Cognito
-    participant ECS as ECS Fargate
-    participant REDIS as ElastiCache
-    participant RDS as Aurora PostgreSQL
-
-    Client->>CF: HTTPS Request
-    CF->>WAF: Edge filtering
-    WAF->>WAF: Rate limit + IP reputation + managed rules
-    WAF->>ALB: Allowed request
-    ALB->>APIGW: Route to API
-    APIGW->>APIGW: Validate request schema + throttle
-    APIGW->>COG: Verify JWT (OAuth2/OIDC)
-    COG-->>APIGW: Token valid + claims
-    APIGW->>ECS: Forward authenticated request
-    ECS->>REDIS: Check cache (cache-aside)
-    alt Cache Hit
-        REDIS-->>ECS: Return cached data
-    else Cache Miss
-        ECS->>RDS: Query (encrypted connection)
-        RDS-->>ECS: Result set
-        ECS->>REDIS: Populate cache (TTL)
-    end
-    ECS-->>Client: Response (via CF edge cache)
-```
+![Request Flow](docs/architecture/request-flow.png)
 
 ---
 
