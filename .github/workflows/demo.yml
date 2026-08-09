@@ -1,0 +1,311 @@
+name: Demo Deployment
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "Action to perform"
+        required: true
+        type: choice
+        options:
+          - deploy
+          - teardown
+        default: deploy
+      ttl_hours:
+        description: "Auto-teardown after N hours (cost safety)"
+        required: false
+        type: number
+        default: 4
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: eu-west-2
+  AWS_SECONDARY_REGION: eu-west-1
+  TF_WORKING_DIR: infrastructure/environments/demo
+  TF_VERSION: "1.6.6"
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Deploy: Provision all infrastructure via Terraform in dependency order
+  # ─────────────────────────────────────────────────────────────────────────────
+  deploy:
+    name: Deploy Demo Environment
+    runs-on: ubuntu-latest
+    if: github.event.inputs.action == 'deploy'
+    timeout-minutes: 25
+    outputs:
+      api_endpoint: ${{ steps.outputs.outputs.api_endpoint }}
+      cognito_domain: ${{ steps.outputs.outputs.cognito_domain }}
+      security_hub_url: ${{ steps.outputs.outputs.security_hub_url }}
+      cloudfront_domain: ${{ steps.outputs.outputs.cloudfront_domain }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # ── OIDC Federation (no stored keys) ──────────────────────────────────
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEMO_ROLE_ARN }}
+          role-session-name: demo-deployment-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verify AWS identity
+        run: aws sts get-caller-identity
+
+      # ── Setup Terraform ───────────────────────────────────────────────────
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform init -input=false
+
+      # ── Wave 1: VPC / Networking ──────────────────────────────────────────
+      - name: "Deploy Wave 1: VPC & Networking"
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform apply -input=false -auto-approve \
+            -target=module.vpc \
+            -target=module.security_groups \
+            -target=module.vpc_endpoints
+
+      # ── Wave 2: KMS / Tagging ─────────────────────────────────────────────
+      - name: "Deploy Wave 2: KMS & Tagging"
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform apply -input=false -auto-approve \
+            -target=module.kms \
+            -target=module.tagging
+
+      # ── Wave 3: Database / Cache / Secrets Rotation ───────────────────────
+      - name: "Deploy Wave 3: Database, Cache & Secrets Rotation"
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform apply -input=false -auto-approve \
+            -target=module.rds \
+            -target=module.elasticache \
+            -target=module.secrets_rotation
+
+      # ── Wave 4: Compute / ALB / Auto Scaling ──────────────────────────────
+      - name: "Deploy Wave 4: Compute, ALB & Auto Scaling"
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform apply -input=false -auto-approve \
+            -target=module.alb \
+            -target=module.ecs \
+            -target=module.auto_scaling \
+            -target=module.cognito
+
+      # ── Wave 5: API Gateway / CloudFront / WAF ────────────────────────────
+      - name: "Deploy Wave 5: API Gateway, CloudFront & WAF"
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform apply -input=false -auto-approve \
+            -target=module.api_gateway \
+            -target=module.cloudfront \
+            -target=module.waf \
+            -target=module.s3_lifecycle
+
+      # ── Wave 6: Security Services ─────────────────────────────────────────
+      - name: "Deploy Wave 6: Security Services (IAM Advanced, Monitoring, Observability)"
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform apply -input=false -auto-approve \
+            -target=module.iam_advanced \
+            -target=module.monitoring \
+            -target=module.observability
+
+      # ── Wave 7: Backup / Service Quotas ───────────────────────────────────
+      - name: "Deploy Wave 7: Backup & Service Quotas"
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform apply -input=false -auto-approve \
+            -target=module.backup \
+            -target=module.service_quotas
+
+      # ── Wave 8: Disaster Recovery ─────────────────────────────────────────
+      - name: "Deploy Wave 8: Disaster Recovery"
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform apply -input=false -auto-approve \
+            -target=module.disaster_recovery
+
+      # ── Final Apply (ensure all cross-references resolved) ────────────────
+      - name: "Final Apply: Resolve all cross-module references"
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform apply -input=false -auto-approve
+
+      # ── Collect Outputs ───────────────────────────────────────────────────
+      - name: Collect deployment outputs
+        id: outputs
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          echo "api_endpoint=$(terraform output -raw api_gateway_endpoint)" >> "$GITHUB_OUTPUT"
+          echo "cognito_domain=$(terraform output -raw cognito_domain)" >> "$GITHUB_OUTPUT"
+          echo "security_hub_url=https://${AWS_REGION}.console.aws.amazon.com/securityhub/home?region=${AWS_REGION}#/summary" >> "$GITHUB_OUTPUT"
+          echo "cloudfront_domain=$(terraform output -raw cloudfront_distribution_domain)" >> "$GITHUB_OUTPUT"
+
+      # ── 4-Hour Cost Alert via SNS ─────────────────────────────────────────
+      - name: Set up cost alert timer
+        run: |
+          TTL_HOURS=${{ github.event.inputs.ttl_hours || 4 }}
+          TTL_SECONDS=$((TTL_HOURS * 3600))
+          ALERT_TIME=$(date -u -d "+${TTL_HOURS} hours" +%Y-%m-%dT%H:%M:%SZ)
+
+          # Create EventBridge rule for cost alert
+          aws events put-rule \
+            --name "demo-cost-alert-${{ github.run_id }}" \
+            --schedule-expression "at(${ALERT_TIME})" \
+            --state ENABLED \
+            --description "Cost alert: Demo environment running > ${TTL_HOURS}h (run ${{ github.run_id }})"
+
+          # Get SNS topic ARN from Terraform output
+          SNS_TOPIC_ARN=$(cd ${{ env.TF_WORKING_DIR }} && terraform output -raw sns_alerts_topic_arn 2>/dev/null || echo "")
+
+          if [ -n "$SNS_TOPIC_ARN" ]; then
+            aws events put-targets \
+              --rule "demo-cost-alert-${{ github.run_id }}" \
+              --targets "Id=cost-alert,Arn=${SNS_TOPIC_ARN},Input={\"source\":\"demo-workflow\",\"detail-type\":\"CostAlert\",\"detail\":{\"message\":\"Demo environment has been running for ${TTL_HOURS}+ hours. Consider tearing down to avoid costs.\",\"run_id\":\"${{ github.run_id }}\",\"started_by\":\"${{ github.actor }}\"}}"
+          fi
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Summary: Output deployment info and usage instructions
+  # ─────────────────────────────────────────────────────────────────────────────
+  summary:
+    name: Deployment Summary
+    runs-on: ubuntu-latest
+    needs: [deploy]
+    if: github.event.inputs.action == 'deploy'
+    steps:
+      - name: Print deployment summary
+        run: |
+          cat <<'EOF'
+          ╔══════════════════════════════════════════════════════════════════════╗
+          ║              🚀 Demo Environment Deployed Successfully              ║
+          ╚══════════════════════════════════════════════════════════════════════╝
+
+          ┌─ API Endpoint ─────────────────────────────────────────────────────┐
+            ${{ needs.deploy.outputs.api_endpoint }}
+          └────────────────────────────────────────────────────────────────────┘
+
+          ┌─ CloudFront Distribution ──────────────────────────────────────────┐
+            https://${{ needs.deploy.outputs.cloudfront_domain }}
+          └────────────────────────────────────────────────────────────────────┘
+
+          ┌─ Sample curl Commands ─────────────────────────────────────────────┐
+
+            # Health check
+            curl -s ${{ needs.deploy.outputs.api_endpoint }}/health | jq .
+
+            # Get products (requires auth token)
+            curl -s -H "Authorization: Bearer <TOKEN>" \
+              ${{ needs.deploy.outputs.api_endpoint }}/api/products | jq .
+
+            # Create product (admin role)
+            curl -s -X POST \
+              -H "Authorization: Bearer <TOKEN>" \
+              -H "Content-Type: application/json" \
+              -d '{"name":"Demo Product","price_pence":1500,"stock_quantity":100,"category":"demo"}' \
+              ${{ needs.deploy.outputs.api_endpoint }}/api/products | jq .
+
+            # List orders
+            curl -s -H "Authorization: Bearer <TOKEN>" \
+              ${{ needs.deploy.outputs.api_endpoint }}/api/orders | jq .
+
+          └────────────────────────────────────────────────────────────────────┘
+
+          ┌─ Cognito Login Instructions ───────────────────────────────────────┐
+
+            1. Navigate to Cognito hosted UI:
+               ${{ needs.deploy.outputs.cognito_domain }}/login?client_id=<CLIENT_ID>&response_type=code&scope=openid+email+profile&redirect_uri=http://localhost:3000/callback
+
+            2. Sign up with email and password (min 12 chars, upper+lower+number+symbol)
+
+            3. Verify email via code sent to inbox
+
+            4. Exchange authorization code for tokens:
+               curl -X POST ${{ needs.deploy.outputs.cognito_domain }}/oauth2/token \
+                 -H "Content-Type: application/x-www-form-urlencoded" \
+                 -d "grant_type=authorization_code&code=<AUTH_CODE>&redirect_uri=http://localhost:3000/callback&client_id=<CLIENT_ID>"
+
+            5. Use the access_token in the Authorization header for API requests
+
+          └────────────────────────────────────────────────────────────────────┘
+
+          ┌─ Security Hub Dashboard ───────────────────────────────────────────┐
+            ${{ needs.deploy.outputs.security_hub_url }}
+          └────────────────────────────────────────────────────────────────────┘
+
+          ┌─ Cost & Teardown ──────────────────────────────────────────────────┐
+            ⚠️  Estimated cost: ~£5 for 2-hour session
+            ⏰  Cost alert configured: SNS notification after ${{ github.event.inputs.ttl_hours || 4 }} hours
+            🧹  Teardown: Re-run this workflow with action=teardown
+          └────────────────────────────────────────────────────────────────────┘
+          EOF
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Teardown: Destroy all provisioned resources
+  # ─────────────────────────────────────────────────────────────────────────────
+  teardown:
+    name: Teardown Demo Environment
+    runs-on: ubuntu-latest
+    if: github.event.inputs.action == 'teardown'
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # ── OIDC Federation (no stored keys) ──────────────────────────────────
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEMO_ROLE_ARN }}
+          role-session-name: demo-teardown-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verify AWS identity
+        run: aws sts get-caller-identity
+
+      # ── Setup Terraform ───────────────────────────────────────────────────
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform init -input=false
+
+      # ── Destroy all resources ─────────────────────────────────────────────
+      - name: Terraform Destroy
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform destroy -input=false -auto-approve
+
+      # ── Clean up cost alert rule ──────────────────────────────────────────
+      - name: Remove cost alert EventBridge rules
+        run: |
+          # Remove any lingering cost alert rules for this repo
+          RULES=$(aws events list-rules --name-prefix "demo-cost-alert-" --query 'Rules[].Name' --output text 2>/dev/null || echo "")
+          for RULE in $RULES; do
+            aws events remove-targets --rule "$RULE" --ids "cost-alert" 2>/dev/null || true
+            aws events delete-rule --name "$RULE" 2>/dev/null || true
+          done
+          echo "✅ Cost alert rules cleaned up"
+
+      - name: Teardown complete
+        run: |
+          echo "╔══════════════════════════════════════════════════════════════════════╗"
+          echo "║           🧹 Demo Environment Destroyed Successfully                ║"
+          echo "╚══════════════════════════════════════════════════════════════════════╝"
+          echo ""
+          echo "All AWS resources have been terminated. Costs will return to zero."

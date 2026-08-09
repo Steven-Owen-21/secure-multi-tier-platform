@@ -1,0 +1,984 @@
+openapi: "3.0.3"
+info:
+  title: Secure Multi-Tier Platform API
+  description: |
+    Enterprise-grade SaaS API backend demonstrating multi-tier AWS architecture.
+    Provides product catalogue management, order processing, user authentication
+    via AWS Cognito (OAuth2 with PKCE), and platform health monitoring.
+  version: "1.0.0"
+  contact:
+    name: Platform Team
+  license:
+    name: MIT
+
+servers:
+  - url: http://localhost:8000
+    description: Local development (Docker Compose)
+  - url: https://api.example.com
+    description: Demo deployment (API Gateway + CloudFront)
+
+tags:
+  - name: health
+    description: Platform health monitoring
+  - name: auth
+    description: User registration and authentication
+  - name: products
+    description: Product catalogue CRUD operations
+  - name: orders
+    description: Order management
+
+security:
+  - BearerAuth: []
+
+paths:
+  /health:
+    get:
+      operationId: healthCheck
+      summary: Platform health check
+      description: |
+        Verifies connectivity to Database_Cluster and Cache_Cluster.
+        Returns 200 when all healthy, 503 when any dependency is unreachable.
+      tags:
+        - health
+      security: []
+      responses:
+        "200":
+          description: All platform dependencies are healthy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+              example:
+                status: healthy
+                components:
+                  - name: Database_Cluster
+                    status: healthy
+                    latency_ms: 2.45
+                    error: null
+                  - name: Cache_Cluster
+                    status: healthy
+                    latency_ms: 0.82
+                    error: null
+                timestamp: "2024-01-15T10:30:00Z"
+        "503":
+          description: One or more dependencies are unhealthy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+              example:
+                status: unhealthy
+                components:
+                  - name: Database_Cluster
+                    status: healthy
+                    latency_ms: 2.45
+                    error: null
+                  - name: Cache_Cluster
+                    status: unhealthy
+                    latency_ms: 5000.0
+                    error: "Connection refused"
+                timestamp: "2024-01-15T10:30:00Z"
+
+  /auth/register:
+    post:
+      operationId: registerUser
+      summary: Register a new user
+      description: |
+        Creates a new user in the Cognito user pool with email as the username.
+        Requires email verification. In local development, the user is auto-confirmed.
+      tags:
+        - auth
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RegisterRequest"
+            example:
+              email: "user@example.com"
+              password: "SecureP@ss123!"
+              full_name: "Jane Smith"
+      responses:
+        "201":
+          description: User registered successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RegisterResponse"
+              example:
+                message: "User registered successfully"
+                user_sub: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+                email: "user@example.com"
+        "409":
+          description: User with this email already exists
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error:
+                  code: "USER_EXISTS"
+                  message: "A user with this email already exists"
+        "422":
+          description: Validation error (invalid password or parameters)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ValidationErrorResponse"
+        "500":
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /auth/login:
+    post:
+      operationId: loginUser
+      summary: Authenticate user and obtain tokens
+      description: |
+        Authenticates a user via Cognito and returns a JWT access token and
+        refresh token. The access token should be included as a Bearer token
+        in the Authorization header for subsequent API requests.
+      tags:
+        - auth
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LoginRequest"
+            example:
+              email: "user@example.com"
+              password: "SecureP@ss123!"
+      responses:
+        "200":
+          description: Authentication successful
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LoginResponse"
+              example:
+                access_token: "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9..."
+                refresh_token: "eyJjdHkiOiJKV1QiLCJlbmMiOiJBMjU2R0NNIi..."
+                token_type: "Bearer"
+                expires_in: 3600
+        "401":
+          description: Invalid credentials
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error:
+                  code: "INVALID_CREDENTIALS"
+                  message: "Invalid email or password"
+        "403":
+          description: User email not confirmed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error:
+                  code: "USER_NOT_CONFIRMED"
+                  message: "User email has not been confirmed"
+        "500":
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /products:
+    get:
+      operationId: listProducts
+      summary: List products with pagination and optional category filter
+      description: |
+        Returns a paginated list of active products. Supports filtering by
+        category and sorting. Results are cached using the cache-aside pattern
+        with a 60-second TTL.
+      tags:
+        - products
+      parameters:
+        - name: page
+          in: query
+          description: Page number (1-based)
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+        - name: page_size
+          in: query
+          description: Number of items per page
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: category
+          in: query
+          description: Filter products by category
+          schema:
+            type: string
+        - name: sort_by
+          in: query
+          description: Field to sort by
+          schema:
+            type: string
+            default: created_at
+      responses:
+        "200":
+          description: Paginated list of products
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProductListResponse"
+        "401":
+          description: Missing or invalid authentication token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "403":
+          description: Insufficient permissions
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+    post:
+      operationId: createProduct
+      summary: Create a new product
+      description: |
+        Creates a new product in the catalogue. Requires admin or manager role.
+        Invalidates the product list cache on success.
+      tags:
+        - products
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProductCreate"
+            example:
+              name: "Pale Ale Malt"
+              description: "Premium base malt for pale ales"
+              price_pence: 2500
+              stock_quantity: 100
+              category: "malts"
+      responses:
+        "201":
+          description: Product created successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProductResponse"
+        "401":
+          description: Missing or invalid authentication token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "403":
+          description: Insufficient permissions (requires admin or manager role)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "422":
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ValidationErrorResponse"
+
+  /products/{product_id}:
+    get:
+      operationId: getProduct
+      summary: Get a single product by ID
+      description: |
+        Returns a single product by its UUID. Cached with a 300-second TTL.
+      tags:
+        - products
+      parameters:
+        - name: product_id
+          in: path
+          required: true
+          description: Product UUID
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Product details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProductResponse"
+        "401":
+          description: Missing or invalid authentication token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "403":
+          description: Insufficient permissions
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Product not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+    put:
+      operationId: updateProduct
+      summary: Update a product
+      description: |
+        Updates an existing product. Only provided fields are changed.
+        Requires admin or manager role. Invalidates relevant caches on success.
+      tags:
+        - products
+      parameters:
+        - name: product_id
+          in: path
+          required: true
+          description: Product UUID
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProductUpdate"
+            example:
+              price_pence: 2750
+              stock_quantity: 85
+      responses:
+        "200":
+          description: Product updated successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProductResponse"
+        "401":
+          description: Missing or invalid authentication token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "403":
+          description: Insufficient permissions (requires admin or manager role)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Product not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "422":
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ValidationErrorResponse"
+
+    delete:
+      operationId: deleteProduct
+      summary: Delete (soft-delete) a product
+      description: |
+        Soft-deletes a product by marking it inactive. Requires admin role only.
+        Invalidates relevant caches on success.
+      tags:
+        - products
+      parameters:
+        - name: product_id
+          in: path
+          required: true
+          description: Product UUID
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "204":
+          description: Product deleted successfully (no content)
+        "401":
+          description: Missing or invalid authentication token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "403":
+          description: Insufficient permissions (requires admin role)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Product not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /orders:
+    post:
+      operationId: createOrder
+      summary: Create a new order
+      description: |
+        Creates an order after validating stock availability for all items.
+        Decrements product stock on success. Requires authenticated user with
+        write permission.
+      tags:
+        - orders
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/OrderCreate"
+            example:
+              items:
+                - product_id: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+                  quantity: 2
+                - product_id: "b2c3d4e5-f6a7-8901-bcde-f12345678901"
+                  quantity: 1
+      responses:
+        "201":
+          description: Order created successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OrderResponse"
+        "400":
+          description: Invalid order (product not found or insufficient stock)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: Missing or invalid authentication token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "403":
+          description: Insufficient permissions
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "422":
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ValidationErrorResponse"
+
+    get:
+      operationId: listOrders
+      summary: List user's orders
+      description: |
+        Returns all orders belonging to the authenticated user, ordered by
+        creation date descending.
+      tags:
+        - orders
+      responses:
+        "200":
+          description: List of user's orders
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/OrderResponse"
+        "401":
+          description: Missing or invalid authentication token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "403":
+          description: Insufficient permissions
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /orders/{order_id}:
+    get:
+      operationId: getOrder
+      summary: Get order by ID
+      description: |
+        Returns a specific order if it belongs to the authenticated user.
+      tags:
+        - orders
+      parameters:
+        - name: order_id
+          in: path
+          required: true
+          description: Order UUID
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Order details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OrderResponse"
+        "401":
+          description: Missing or invalid authentication token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "403":
+          description: Insufficient permissions
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Order not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        JWT access token obtained from AWS Cognito via OAuth2 Authorization Code
+        flow with PKCE. Include the token in the Authorization header as:
+        `Authorization: Bearer <token>`
+
+  schemas:
+    # --- Health ---
+    ComponentHealth:
+      type: object
+      required:
+        - name
+        - status
+      properties:
+        name:
+          type: string
+          description: Component identifier
+          example: Database_Cluster
+        status:
+          type: string
+          enum:
+            - healthy
+            - unhealthy
+            - degraded
+          description: Component health status
+        latency_ms:
+          type: number
+          format: float
+          nullable: true
+          description: Latency of the health check in milliseconds
+          example: 2.45
+        error:
+          type: string
+          nullable: true
+          description: Error message if component is unhealthy
+          example: null
+
+    HealthResponse:
+      type: object
+      required:
+        - status
+        - components
+        - timestamp
+      properties:
+        status:
+          type: string
+          enum:
+            - healthy
+            - unhealthy
+            - degraded
+          description: Aggregate platform health status
+        components:
+          type: array
+          items:
+            $ref: "#/components/schemas/ComponentHealth"
+          description: Individual component health checks
+        timestamp:
+          type: string
+          format: date-time
+          description: Timestamp of the health check
+
+    # --- Auth ---
+    RegisterRequest:
+      type: object
+      required:
+        - email
+        - password
+        - full_name
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 255
+          description: User email address
+        password:
+          type: string
+          minLength: 12
+          maxLength: 128
+          description: Password (min 12 chars, must include uppercase, lowercase, number, symbol)
+        full_name:
+          type: string
+          minLength: 1
+          maxLength: 255
+          description: User's full name
+
+    RegisterResponse:
+      type: object
+      required:
+        - message
+        - user_sub
+        - email
+      properties:
+        message:
+          type: string
+          description: Success message
+        user_sub:
+          type: string
+          description: Cognito user subject identifier (UUID)
+        email:
+          type: string
+          format: email
+          description: Registered email address
+
+    LoginRequest:
+      type: object
+      required:
+        - email
+        - password
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 255
+          description: User email address
+        password:
+          type: string
+          minLength: 1
+          maxLength: 128
+          description: User password
+
+    LoginResponse:
+      type: object
+      required:
+        - access_token
+        - refresh_token
+        - token_type
+        - expires_in
+      properties:
+        access_token:
+          type: string
+          description: JWT access token for API authorization
+        refresh_token:
+          type: string
+          description: Refresh token for obtaining new access tokens
+        token_type:
+          type: string
+          enum:
+            - Bearer
+          default: Bearer
+          description: Token type (always Bearer)
+        expires_in:
+          type: integer
+          description: Token expiry time in seconds
+          example: 3600
+
+    # --- Products ---
+    ProductCreate:
+      type: object
+      required:
+        - name
+        - price_pence
+        - stock_quantity
+        - category
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 255
+          description: Product name
+        description:
+          type: string
+          maxLength: 2000
+          nullable: true
+          description: Product description
+        price_pence:
+          type: integer
+          minimum: 1
+          maximum: 10000000
+          description: Price in pence (max £100,000)
+        stock_quantity:
+          type: integer
+          minimum: 0
+          description: Available stock quantity
+        category:
+          type: string
+          minLength: 1
+          maxLength: 100
+          description: Product category
+
+    ProductUpdate:
+      type: object
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 255
+          nullable: true
+          description: Product name
+        description:
+          type: string
+          maxLength: 2000
+          nullable: true
+          description: Product description
+        price_pence:
+          type: integer
+          minimum: 1
+          maximum: 10000000
+          nullable: true
+          description: Price in pence
+        stock_quantity:
+          type: integer
+          minimum: 0
+          nullable: true
+          description: Available stock quantity
+        category:
+          type: string
+          minLength: 1
+          maxLength: 100
+          nullable: true
+          description: Product category
+        is_active:
+          type: boolean
+          nullable: true
+          description: Whether the product is active
+
+    ProductResponse:
+      type: object
+      required:
+        - id
+        - name
+        - price_pence
+        - stock_quantity
+        - category
+        - is_active
+        - created_at
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Product UUID
+        name:
+          type: string
+          description: Product name
+        description:
+          type: string
+          nullable: true
+          description: Product description
+        price_pence:
+          type: integer
+          description: Price in pence
+        stock_quantity:
+          type: integer
+          description: Available stock quantity
+        category:
+          type: string
+          description: Product category
+        is_active:
+          type: boolean
+          description: Whether the product is active
+        created_at:
+          type: string
+          format: date-time
+          description: Creation timestamp
+
+    ProductListResponse:
+      type: object
+      required:
+        - items
+        - total
+        - page
+        - page_size
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/ProductResponse"
+          description: List of products for the current page
+        total:
+          type: integer
+          description: Total number of matching products
+        page:
+          type: integer
+          description: Current page number
+        page_size:
+          type: integer
+          description: Number of items per page
+
+    # --- Orders ---
+    OrderItemCreate:
+      type: object
+      required:
+        - product_id
+        - quantity
+      properties:
+        product_id:
+          type: string
+          format: uuid
+          description: UUID of the product to order
+        quantity:
+          type: integer
+          minimum: 1
+          maximum: 100
+          description: Quantity to order
+
+    OrderCreate:
+      type: object
+      required:
+        - items
+      properties:
+        items:
+          type: array
+          minItems: 1
+          maxItems: 50
+          items:
+            $ref: "#/components/schemas/OrderItemCreate"
+          description: List of items to include in the order
+
+    OrderItemResponse:
+      type: object
+      required:
+        - id
+        - product_id
+        - quantity
+        - unit_price_pence
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Order item UUID
+        product_id:
+          type: string
+          format: uuid
+          description: Product UUID
+        quantity:
+          type: integer
+          description: Quantity ordered
+        unit_price_pence:
+          type: integer
+          description: Unit price at time of order in pence
+
+    OrderResponse:
+      type: object
+      required:
+        - id
+        - user_id
+        - status
+        - total_pence
+        - items
+        - created_at
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Order UUID
+        user_id:
+          type: string
+          format: uuid
+          description: UUID of the user who placed the order
+        status:
+          type: string
+          description: Order status
+          example: pending
+        total_pence:
+          type: integer
+          description: Total order value in pence
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/OrderItemResponse"
+          description: Line items in the order
+        created_at:
+          type: string
+          format: date-time
+          description: Order creation timestamp
+
+    # --- Errors ---
+    ErrorResponse:
+      type: object
+      required:
+        - error
+      properties:
+        error:
+          type: object
+          required:
+            - code
+            - message
+          properties:
+            code:
+              type: string
+              description: Machine-readable error code
+              example: "INVALID_CREDENTIALS"
+            message:
+              type: string
+              description: Human-readable error message
+              example: "Invalid email or password"
+            request_id:
+              type: string
+              nullable: true
+              description: Request correlation ID for tracing
+            details:
+              type: object
+              nullable: true
+              additionalProperties: true
+              description: Additional error context
+
+    ValidationErrorResponse:
+      type: object
+      required:
+        - detail
+      properties:
+        detail:
+          type: array
+          items:
+            type: object
+            properties:
+              loc:
+                type: array
+                items:
+                  oneOf:
+                    - type: string
+                    - type: integer
+                description: Field location path
+              msg:
+                type: string
+                description: Validation error message
+              type:
+                type: string
+                description: Error type identifier
+          description: List of field-level validation errors
