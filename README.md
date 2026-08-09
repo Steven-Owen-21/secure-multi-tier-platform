@@ -50,65 +50,7 @@
 
 ## 🏗️ System Architecture
 
-```mermaid
-graph TB
-    subgraph "Edge Layer"
-        CF[CloudFront CDN<br/>Edge Caching + OAC]
-        WAF[AWS WAF<br/>Managed Rules + Rate Limiting]
-        R53[Route 53<br/>Failover Routing]
-    end
-
-    subgraph "Public Subnet"
-        ALB[Application Load Balancer<br/>TLS Termination]
-        APIGW[API Gateway<br/>Usage Plans + Throttling]
-        NAT[NAT Gateways<br/>Multi-AZ]
-    end
-
-    subgraph "Private Subnet - Application Tier"
-        ECS[ECS Fargate<br/>Auto Scaling + Scale-to-Zero]
-        COG[Cognito<br/>OAuth2/OIDC + PKCE]
-    end
-
-    subgraph "Private Subnet - Data Tier"
-        RDS[Aurora PostgreSQL<br/>Multi-AZ + KMS Encryption]
-        REDIS[ElastiCache Redis<br/>Failover + TLS]
-        S3[S3 Storage<br/>Intelligent Tiering + Object Lock]
-    end
-
-    subgraph "Security & Monitoring"
-        GD[GuardDuty<br/>Threat Detection]
-        SH[Security Hub<br/>Unified Posture]
-        CFG[AWS Config<br/>Compliance Rules]
-        CW[CloudWatch<br/>Composite Alarms + Anomaly Detection]
-        KMS[KMS<br/>CMK + Encryption Context]
-        SM[Secrets Manager<br/>30-day Auto Rotation]
-    end
-
-    subgraph "DR Region"
-        RDS_DR[Aurora Read Replica<br/>Cross-Region]
-        S3_DR[S3 Cross-Region Replication]
-        VAULT[AWS Backup Vault<br/>Cross-Region + Vault Lock]
-    end
-
-    R53 --> CF
-    CF --> WAF --> ALB
-    ALB --> APIGW
-    APIGW --> COG
-    APIGW --> ECS
-    ECS --> RDS
-    ECS --> REDIS
-    ECS --> S3
-    NAT --> ECS
-
-    GD & CFG --> SH
-    CW --> ECS & RDS & REDIS
-    KMS --> RDS & S3
-    SM --> RDS & REDIS
-
-    RDS -.->|Async Replication| RDS_DR
-    S3 -.->|CRR| S3_DR
-    RDS -.->|Backup| VAULT
-```
+![Secure Multi-Tier Platform Architecture](docs/architecture/architecture.png)
 
 ---
 
