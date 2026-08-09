@@ -74,6 +74,9 @@ with Diagram("Secure Multi-Tier Platform", show=False, filename="docs/architectu
     sechub >> sns
     cw >> sns
 
+    # NAT Gateway (private subnet outbound)
+    ecs >> Edge(style="dashed", color="gray", label="Outbound via NAT") >> nat
+
     # DR connections
     aurora >> Edge(style="dotted", label="Async Replication") >> aurora_dr
     s3 >> Edge(style="dotted", label="CRR") >> s3_dr
